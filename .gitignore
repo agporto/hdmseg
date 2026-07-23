@@ -12,6 +12,8 @@ venv/
 dist/
 build/
 *.so
+*.pyd
+*.pdb
 *.whl
 
 # Verification scratch
