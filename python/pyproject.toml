@@ -1,0 +1,37 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "hdmseg"
+description = "Population-consistent spectral segmentation by correspondence-collapsed consensus diffusion"
+readme = "README.md"
+license = "BSD-2-Clause"
+authors = [{ name = "Arthur Porto", email = "agporto@gmail.com" }]
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21"]
+keywords = ["segmentation", "diffusion-maps", "spectral-clustering", "morphometrics", "shape"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Rust",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/agporto/hdmseg"
+Repository = "https://github.com/agporto/hdmseg"
+Changelog = "https://github.com/agporto/hdmseg/blob/main/CHANGELOG.md"
+Issues = "https://github.com/agporto/hdmseg/issues"
+
+[tool.maturin]
+python-source = "python"
+module-name = "hdmseg._core"
+features = ["extension-module"]

@@ -1,0 +1,63 @@
+cff-version: 1.2.0
+message: "If you use hdmseg in your research, please cite it."
+title: "hdmseg: population-consistent surface segmentation by correspondence-collapsed diffusion maps"
+abstract: >-
+  A fast, deterministic Rust implementation (with Python bindings) of
+  population-consistent surface segmentation for homologous shapes in dense
+  correspondence. It builds a frame-free consensus diffusion operator on the
+  loci, embeds it spectrally, and clusters the embedding into regions coherent
+  across the whole sample, with bootstrap-stability model selection.
+type: software
+authors:
+  - family-names: Porto
+    given-names: Arthur
+    email: agporto@gmail.com
+license: BSD-2-Clause
+repository-code: "https://github.com/agporto/hdmseg"
+url: "https://github.com/agporto/hdmseg"
+version: 0.1.0
+keywords:
+  - surface segmentation
+  - diffusion maps
+  - consensus diffusion maps
+  - spectral clustering
+  - morphometrics
+  - Rust
+references:
+  - type: report
+    title: "Hypoelliptic Diffusion Maps I: Tangent Bundles"
+    authors:
+      - family-names: Gao
+        given-names: Tingran
+    year: 2015
+    notes: "arXiv:1503.05459; cited as methodological context, not as an implemented algorithm"
+  - type: report
+    title: "The Diffusion Geometry of Fibre Bundles: Horizontal Diffusion Maps"
+    authors:
+      - family-names: Gao
+        given-names: Tingran
+    year: 2016
+    notes: "arXiv:1602.02330; cited as methodological context, not as an implemented algorithm"
+  - type: article
+    title: "Diffusion maps"
+    authors:
+      - family-names: Coifman
+        given-names: Ronald R.
+      - family-names: Lafon
+        given-names: Stéphane
+    journal: "Applied and Computational Harmonic Analysis"
+    volume: 21
+    issue: 1
+    year: 2006
+    doi: "10.1016/j.acha.2006.04.006"
+  - type: conference-paper
+    title: "On Spectral Clustering: Analysis and an algorithm"
+    authors:
+      - family-names: Ng
+        given-names: Andrew Y.
+      - family-names: Jordan
+        given-names: Michael I.
+      - family-names: Weiss
+        given-names: Yair
+    year: 2002
+    notes: "Advances in Neural Information Processing Systems (NIPS)"
