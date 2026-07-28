@@ -29,7 +29,7 @@ pub fn operator_and_spectrum(
         return Err(HdmError::InvalidConfig("n_eigenvalues must be >= 1".into()));
     }
 
-    let graph = Graph::knn(stack, n_neighbors);
+    let graph = Graph::knn(stack, n_neighbors, false);
     let subset: Vec<usize> = (0..stack.n()).collect();
     let operator = affinity::consensus(stack, &graph, &subset)?;
     let normalized = diffusion::normalize(&operator);

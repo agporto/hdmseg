@@ -14,9 +14,10 @@ clustering of that operator produces one partition shared by the population.
 ## Status
 
 hdmseg is pre-release research software. The current implementation uses an
-exact dense eigendecomposition. It is suitable only when `M × M` dense storage
-and `O(M³)` eigendecomposition are practical; benchmark your intended locus
-count before committing to the method.
+edge-sparse consensus operator and a partial self-adjoint eigensolver for large
+connected graphs. Small graphs, disconnected graphs, and partial solves that
+miss strict residual checks automatically use the original dense
+eigendecomposition. Benchmark your intended locus count and graph connectivity.
 
 The implementation is inspired by correspondence-aware diffusion methods, but
 it is **not** a horizontal or hypoelliptic diffusion-map implementation. It has
@@ -84,7 +85,10 @@ Parameter guidance is in [`docs/TUNING.md`](docs/TUNING.md).
 3. **Symmetric normalization** — form
    `S = D^{-1/2} W D^{-1/2}`. A zero-degree locus receives a unit self-loop and
    therefore remains an explicit singleton.
-4. **Dense spectral solve** — compute the symmetric eigendecomposition of `S`.
+4. **Spectral solve** — compute only the leading eigenpairs of `I + S` with a
+   sparse Krylov-Schur solve, then subtract the identity shift. This selects
+   the same largest-algebraic modes of `S`; a dense compatibility path handles
+   small, disconnected, or nonconverged cases.
 5. **Clustering** — row-normalize the leading `k` eigenvectors and apply
    deterministic k-means (Ng-Jordan-Weiss).
 6. **Model selection** — choose `k` by bootstrap stability, modularity, or an
@@ -96,17 +100,32 @@ leading mode. Clustering uses raw leading eigenvectors and is independent of
 
 ## Complexity and limits
 
-- The brute-force reference kNN search is `O(M² log M)`.
-- The consensus and normalized operators use `O(M²)` memory.
-- The exact dense eigendecomposition is `O(M³)`.
-- Bootstrap stability repeats operator construction and eigendecomposition
-  `n_boot` times. Replicates run sequentially to bound dense memory; each
-  eigensolve may use internal parallelism.
+- The deterministic brute-force reference kNN search is `O(M²)` time and uses
+  top-k selection rather than sorting all pairwise distances.
+- With `E` undirected union-kNN edges, consensus construction, normalization,
+  modularity, and matrix-vector products store `O(E)` values instead of dense
+  `M × M` matrices.
+- The partial eigensolver stores `O(E + M r + r²)` values for Krylov subspace
+  width `r`; its work depends on spectral separation rather than a fixed
+  `O(M³)` decomposition.
+- Bootstrap stability caches the `N × E` per-specimen affinities once and
+  reuses them for every resample. Independent sparse solves run in parallel
+  with deterministic result reduction.
+- The input correspondence stack itself occupies `O(N M D)` memory.
 
-No sparse or approximate eigensolver is currently provided. Parallel and
-serial execution are tested to produce the same partition and stability score
-on a given machine. Exact floating-point identity across CPU architectures is
-not guaranteed.
+If the positive-weight graph is disconnected, hdmseg deliberately falls back
+to the original `O(M²)`-memory, `O(M³)` dense solve because a single-vector
+Krylov method cannot reliably recover repeated component eigenvalues. Parallel
+and serial execution are tested to produce the same partition and stability
+score on a given machine. Exact floating-point identity across CPU
+architectures is not guaranteed.
+
+The repository includes a reproducible scale benchmark:
+
+```bash
+cargo run --release --example bench_scale -- 1000 5000 fixed
+cargo run --release --example bench_scale -- 1000 5000 stability 20
+```
 
 ## Rust
 

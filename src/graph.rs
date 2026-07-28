@@ -8,6 +8,8 @@ use crate::vendored::spatial;
 #[derive(Debug, Clone)]
 pub struct Graph {
     neighbors: Vec<Vec<usize>>,
+    edges: Vec<(usize, usize)>,
+    incident_edges: Vec<Vec<usize>>,
 }
 
 impl Graph {
@@ -15,8 +17,8 @@ impl Graph {
     /// An edge `(p, q)` exists if `q` is among `p`'s `k` nearest neighbors
     /// or vice versa (the union symmetrization standard in spectral
     /// clustering).
-    pub fn knn(stack: &Stack, k: usize) -> Self {
-        let directed = spatial::knn(stack.reference(), k);
+    pub fn knn(stack: &Stack, k: usize, parallel: bool) -> Self {
+        let directed = spatial::knn(stack.reference(), k, parallel);
         let m = directed.len();
         let mut sets: Vec<Vec<usize>> = vec![Vec::new(); m];
         for (p, nbrs) in directed.iter().enumerate() {
@@ -29,10 +31,27 @@ impl Graph {
             s.sort_unstable();
             s.dedup();
         }
-        Self { neighbors: sets }
+        let mut edges = Vec::new();
+        let mut incident_edges = vec![Vec::new(); m];
+        for (p, nbrs) in sets.iter().enumerate() {
+            for &q in nbrs {
+                if q > p {
+                    let edge = edges.len();
+                    edges.push((p, q));
+                    incident_edges[p].push(edge);
+                    incident_edges[q].push(edge);
+                }
+            }
+        }
+        Self {
+            neighbors: sets,
+            edges,
+            incident_edges,
+        }
     }
 
     /// Neighbor list of locus `p`.
+    #[cfg(any(test, feature = "verification"))]
     pub fn neighbors(&self, p: usize) -> &[usize] {
         &self.neighbors[p]
     }
@@ -42,13 +61,19 @@ impl Graph {
         self.neighbors.len()
     }
 
+    /// Undirected edges, sorted lexicographically as `(p, q)` with `p < q`.
+    pub fn edge_slice(&self) -> &[(usize, usize)] {
+        &self.edges
+    }
+
+    /// Edge indices incident on `p`, ordered by the neighboring locus index.
+    pub fn incident_edges(&self, p: usize) -> &[usize] {
+        &self.incident_edges[p]
+    }
+
     /// Iterate every undirected edge once, as `(p, q)` with `p < q`.
+    #[cfg(any(test, feature = "verification"))]
     pub fn edges(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
-        self.neighbors.iter().enumerate().flat_map(|(p, nbrs)| {
-            nbrs.iter()
-                .copied()
-                .filter(move |&q| q > p)
-                .map(move |q| (p, q))
-        })
+        self.edges.iter().copied()
     }
 }

@@ -3,7 +3,8 @@
 //! Population-consistent surface segmentation by **correspondence-collapsed
 //! consensus diffusion maps**. Given a stack of `N` homologous shapes sharing
 //! `M` loci in dense correspondence, hdmseg builds one `M × M` frame-free
-//! consensus operator on the loci and applies dense spectral clustering.
+//! consensus operator on the loci and applies spectral clustering without
+//! materializing its structural zeros.
 //!
 //! This is not a horizontal or hypoelliptic diffusion-map implementation.
 //!
@@ -38,6 +39,7 @@ pub use error::{HdmError, Result};
 
 use graph::Graph;
 use nalgebra::DMatrix;
+use rayon::prelude::*;
 use spectral::Embedding;
 
 /// How to choose the number of regions `k`.
@@ -119,7 +121,14 @@ fn split_next(state: &mut u64) -> u64 {
 
 /// Build the kNN reference graph.
 fn build_graph(stack: &Stack, cfg: &Config) -> Graph {
-    Graph::knn(stack, cfg.n_neighbors.max(1))
+    Graph::knn(stack, cfg.n_neighbors.max(1), cfg.parallel)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SolverKind {
+    Auto,
+    Dense,
+    Sparse,
 }
 
 fn validate_config(stack: &Stack, cfg: &Config) -> Result<()> {
@@ -183,30 +192,54 @@ fn validate_config(stack: &Stack, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Build the consensus operator and its spectral embedding for a specimen
-/// subset (`0..N` for the full sample; a resample for bootstrapping).
-fn operator_and_embedding(
-    stack: &Stack,
+/// Normalize a sparse consensus operator and compute its requested spectral
+/// products. Auto mode retains the dense implementation as a compatibility
+/// fallback whenever the partial sparse solve is inapplicable or fails its
+/// residual checks.
+fn embedding_from_weights(
     graph: &Graph,
-    subset: &[usize],
+    weights: &affinity::EdgeWeights,
     n_vectors: usize,
     coord_dims: usize,
     cfg: &Config,
-) -> Result<(DMatrix<f64>, Embedding)> {
-    let w = affinity::consensus(stack, graph, subset)?;
-    let norm = diffusion::normalize(&w);
-    let emb = spectral::dense(
-        &norm,
+    solver: SolverKind,
+    parallel: bool,
+) -> Result<(Embedding, bool)> {
+    let norm = diffusion::normalize_edges(weights, graph);
+    if solver != SolverKind::Dense && spectral::sparse_applicable(&norm, graph, n_vectors) {
+        match spectral::sparse(
+            &norm,
+            graph,
+            n_vectors,
+            coord_dims,
+            cfg.diffusion_time,
+            parallel,
+        ) {
+            Ok(embedding) => return Ok((embedding, true)),
+            Err(error) if solver == SolverKind::Sparse => return Err(error),
+            Err(_) => {}
+        }
+    } else if solver == SolverKind::Sparse {
+        return Err(HdmError::EigenFailed);
+    }
+
+    let dense_norm = norm.to_dense(graph);
+    let embedding = spectral::dense(
+        &dense_norm,
         n_vectors,
         coord_dims,
         cfg.diffusion_time,
-        cfg.parallel,
+        parallel,
     )?;
-    Ok((w, emb))
+    Ok((embedding, false))
 }
 
 /// Segment the stack.
 pub fn segment(stack: &Stack, cfg: &Config) -> Result<Segmentation> {
+    segment_with_solver(stack, cfg, SolverKind::Auto)
+}
+
+fn segment_with_solver(stack: &Stack, cfg: &Config, solver: SolverKind) -> Result<Segmentation> {
     validate_config(stack, cfg)?;
     let m = stack.m();
 
@@ -219,13 +252,27 @@ pub fn segment(stack: &Stack, cfg: &Config) -> Result<Segmentation> {
     let n_vectors = (coord_dims + 1).max(selection_vectors).min(m);
 
     let graph = build_graph(stack, cfg);
-    let (w_full, emb_full) = operator_and_embedding(
-        stack,
+    // Stability reuses every per-specimen affinity row for the full operator
+    // and all bootstrap resamples. Other selection modes stream rows in
+    // bounded batches and retain only the consensus edge vector.
+    let affinity_cache = if matches!(cfg.select, SelectSpec::Stability { .. }) {
+        Some(affinity::AffinityCache::build(stack, &graph, cfg.parallel)?)
+    } else {
+        None
+    };
+    let full = full_subset(stack.n());
+    let w_full = match &affinity_cache {
+        Some(cache) => cache.consensus(&graph, &full)?,
+        None => affinity::consensus_edges(stack, &graph, &full, cfg.parallel)?,
+    };
+    let (emb_full, full_used_sparse) = embedding_from_weights(
         &graph,
-        &full_subset(stack.n()),
+        &w_full,
         n_vectors,
         coord_dims,
         cfg,
+        solver,
+        cfg.parallel,
     )?;
 
     let (k, labels, stability) = match cfg.select {
@@ -242,7 +289,7 @@ pub fn segment(stack: &Stack, cfg: &Config) -> Result<Segmentation> {
             let mut best_labels = Vec::new();
             for k in 2..=hi {
                 let labels = cluster::kmeans(&emb_full.vectors, k, cfg.seed);
-                let q = select::modularity(&w_full, &labels);
+                let q = select::modularity_edges(&graph, &w_full, &labels);
                 if q > best_q {
                     best_q = q;
                     best_k = k;
@@ -263,6 +310,9 @@ pub fn segment(stack: &Stack, cfg: &Config) -> Result<Segmentation> {
 
             let n = stack.n();
             let boot = n_boot;
+            let cache = affinity_cache
+                .as_ref()
+                .expect("stability always constructs an affinity cache");
 
             // Draw every resample's index-set sequentially first, so the RNG
             // stream (and thus the resamples) is fixed regardless of how the
@@ -276,13 +326,20 @@ pub fn segment(stack: &Stack, cfg: &Config) -> Result<Segmentation> {
                 })
                 .collect();
 
-            // Process bootstrap operators one at a time to keep dense M × M
-            // memory bounded. Individual eigensolves may still use the rayon
-            // pool when cfg.parallel is true.
-            let score_one = |subset: &Vec<usize>| -> Result<Vec<f64>> {
-                let (wb, emb_b) =
-                    operator_and_embedding(stack, &graph, subset, n_vectors, coord_dims, cfg)?;
-                drop(wb);
+            let score_one = |subset: &Vec<usize>,
+                             solve: SolverKind,
+                             inner_parallel: bool|
+             -> Result<Vec<f64>> {
+                let weights = cache.consensus(&graph, subset)?;
+                let (emb_b, _) = embedding_from_weights(
+                    &graph,
+                    &weights,
+                    n_vectors,
+                    coord_dims,
+                    cfg,
+                    solve,
+                    inner_parallel,
+                )?;
                 Ok((2..=hi)
                     .enumerate()
                     .map(|(ki, k)| {
@@ -291,8 +348,31 @@ pub fn segment(stack: &Stack, cfg: &Config) -> Result<Segmentation> {
                     })
                     .collect())
             };
-            let per_boot: Result<Vec<Vec<f64>>> = subsets.iter().map(&score_one).collect();
-            let per_boot = per_boot?;
+
+            // Sparse bootstrap solves are independent. Run them across the
+            // rayon pool with sequential inner kernels to avoid
+            // oversubscription. If any partial solve misses convergence, redo
+            // the batch sequentially through Auto so the dense reference
+            // fallback remains available and memory stays bounded.
+            let per_boot = if cfg.parallel && full_used_sparse && solver != SolverKind::Dense {
+                let sparse_attempt: Result<Vec<Vec<f64>>> = subsets
+                    .par_iter()
+                    .map(|subset| score_one(subset, SolverKind::Sparse, false))
+                    .collect();
+                match sparse_attempt {
+                    Ok(scores) => scores,
+                    Err(error) if solver == SolverKind::Sparse => return Err(error),
+                    Err(_) => subsets
+                        .iter()
+                        .map(|subset| score_one(subset, SolverKind::Auto, cfg.parallel))
+                        .collect::<Result<Vec<_>>>()?,
+                }
+            } else {
+                subsets
+                    .iter()
+                    .map(|subset| score_one(subset, solver, cfg.parallel))
+                    .collect::<Result<Vec<_>>>()?
+            };
 
             // Fixed-order reduction: sum over resamples in index order.
             let mut ari_sum = vec![0.0_f64; hi + 1]; // index by k
@@ -316,7 +396,7 @@ pub fn segment(stack: &Stack, cfg: &Config) -> Result<Segmentation> {
         }
     };
 
-    let modularity = select::modularity(&w_full, &labels);
+    let modularity = select::modularity_edges(&graph, &w_full, &labels);
 
     Ok(Segmentation {
         labels,
@@ -375,6 +455,29 @@ mod tests {
         let a = labels[0];
         let b = labels[per];
         a != b && labels[..per].iter().all(|&l| l == a) && labels[per..].iter().all(|&l| l == b)
+    }
+
+    fn connected_curve_stack(n: usize, m: usize, jitter: f64) -> Stack {
+        let d = 3;
+        let mut rng = 0xCAFE_F00D_1234_5678_u64;
+        let unit = |state: &mut u64| -> f64 {
+            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        let mut flat = vec![0.0; n * m * d];
+        for i in 0..n {
+            for p in 0..m {
+                let t = p as f64 / (m - 1) as f64;
+                let base = (i * m + p) * d;
+                flat[base] = 5.0 * t + jitter * unit(&mut rng);
+                flat[base + 1] = (3.0 * std::f64::consts::TAU * t).sin() + jitter * unit(&mut rng);
+                flat[base + 2] = (2.0 * std::f64::consts::TAU * t).cos() + jitter * unit(&mut rng);
+            }
+        }
+        Stack::from_flat(&flat, n, m, d, None).unwrap()
     }
 
     #[test]
@@ -630,6 +733,226 @@ mod tests {
         let graph = build_graph(&stack, &Config::default());
         assert!(affinity::consensus(&stack, &graph, &[]).is_err());
         assert!(affinity::consensus(&stack, &graph, &[stack.n()]).is_err());
+        assert!(affinity::consensus_edges(&stack, &graph, &[], true).is_err());
+        assert!(affinity::consensus_edges(&stack, &graph, &[stack.n()], true).is_err());
+    }
+
+    #[test]
+    fn sparse_affinity_is_bitwise_identical_to_legacy_dense_affinity() {
+        let stack = two_blob_stack(9, 40, 0.05);
+        let graph = Graph::knn(&stack, 10, false);
+        let subset = [8, 1, 1, 4, 0, 7, 3, 8, 2];
+        let legacy = affinity::consensus(&stack, &graph, &subset).unwrap();
+        let serial = affinity::consensus_edges(&stack, &graph, &subset, false)
+            .unwrap()
+            .to_dense(&graph);
+        let parallel = affinity::consensus_edges(&stack, &graph, &subset, true)
+            .unwrap()
+            .to_dense(&graph);
+        let cached = affinity::AffinityCache::build(&stack, &graph, true)
+            .unwrap()
+            .consensus(&graph, &subset)
+            .unwrap()
+            .to_dense(&graph);
+        assert_eq!(serial, legacy);
+        assert_eq!(parallel, legacy);
+        assert_eq!(cached, legacy);
+    }
+
+    #[test]
+    fn parallel_top_k_graph_matches_serial_graph() {
+        let stack = two_blob_stack(5, 80, 0.03);
+        let serial = Graph::knn(&stack, 12, false);
+        let parallel = Graph::knn(&stack, 12, true);
+        assert_eq!(serial.edge_slice(), parallel.edge_slice());
+        for p in 0..stack.m() {
+            assert_eq!(serial.neighbors(p), parallel.neighbors(p));
+            assert_eq!(serial.incident_edges(p), parallel.incident_edges(p));
+        }
+    }
+
+    #[test]
+    fn sparse_normalization_and_modularity_match_dense_operator_bitwise() {
+        let stack = two_blob_stack(7, 45, 0.04);
+        let graph = Graph::knn(&stack, 11, false);
+        let subset: Vec<_> = (0..stack.n()).collect();
+        let edges = affinity::consensus_edges(&stack, &graph, &subset, true).unwrap();
+        let dense_w = edges.to_dense(&graph);
+        let dense_norm = diffusion::normalize(&dense_w);
+        let sparse_norm = diffusion::normalize_edges(&edges, &graph).to_dense(&graph);
+        assert_eq!(sparse_norm.degree, dense_norm.degree);
+        // faer's self-adjoint eigensolver consumes the lower triangle.  The
+        // sparse representation matches that triangle bit-for-bit.  The old
+        // dense matrix can differ by one rounding bit across its unused upper
+        // triangle because the two multiplication orders are reversed.
+        for p in 0..stack.m() {
+            for q in 0..=p {
+                assert_eq!(sparse_norm.s[(p, q)], dense_norm.s[(p, q)]);
+            }
+        }
+
+        let labels: Vec<usize> = (0..stack.m()).map(|p| (p / 13) % 5).collect();
+        assert_eq!(
+            select::modularity_edges(&graph, &edges, &labels),
+            select::modularity(&dense_w, &labels)
+        );
+    }
+
+    #[test]
+    fn sparse_and_dense_eigenspaces_are_equivalent() {
+        let stack = connected_curve_stack(6, 320, 0.002);
+        let graph = Graph::knn(&stack, 10, true);
+        let subset: Vec<_> = (0..stack.n()).collect();
+        let weights = affinity::consensus_edges(&stack, &graph, &subset, true).unwrap();
+        let normalized_edges = diffusion::normalize_edges(&weights, &graph);
+        assert!(spectral::sparse_applicable(&normalized_edges, &graph, 10));
+        let dense = spectral::dense(&normalized_edges.to_dense(&graph), 10, 8, 1.0, true).unwrap();
+        let sparse = spectral::sparse(&normalized_edges, &graph, 10, 8, 1.0, true).unwrap();
+        for j in 0..10 {
+            assert!(
+                (dense.eigenvalues[j] - sparse.eigenvalues[j]).abs() < 1e-8,
+                "eigenvalue {j}: dense={}, sparse={}",
+                dense.eigenvalues[j],
+                sparse.eigenvalues[j]
+            );
+        }
+        let dense_projector = &dense.vectors * dense.vectors.transpose();
+        let sparse_projector = &sparse.vectors * sparse.vectors.transpose();
+        let max_projector_error = dense_projector
+            .iter()
+            .zip(sparse_projector.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_projector_error < 1e-6,
+            "projector error {max_projector_error}"
+        );
+    }
+
+    #[test]
+    fn sparse_pipeline_matches_dense_for_every_selection_mode() {
+        let stack = connected_curve_stack(8, 320, 0.003);
+        let selections = [
+            SelectSpec::Fixed(4),
+            SelectSpec::Eigengap { max_k: 5 },
+            SelectSpec::Modularity { max_k: 5 },
+            SelectSpec::Stability {
+                max_k: 5,
+                n_boot: 3,
+                seed: 11,
+            },
+        ];
+        for select in selections {
+            let cfg = Config {
+                n_neighbors: 10,
+                n_components: 8,
+                select,
+                seed: 3,
+                parallel: true,
+                ..Config::default()
+            };
+            let dense = segment_with_solver(&stack, &cfg, SolverKind::Dense).unwrap();
+            let sparse = segment_with_solver(&stack, &cfg, SolverKind::Sparse).unwrap();
+            assert_eq!(sparse.k, dense.k, "selection mode {select:?}");
+            assert!(
+                (select::adjusted_rand_index(&sparse.labels, &dense.labels) - 1.0).abs() < 1e-12,
+                "partition mismatch for {select:?}"
+            );
+            assert!(
+                (sparse.modularity - dense.modularity).abs() < 1e-10,
+                "modularity mismatch for {select:?}"
+            );
+            match (dense.stability, sparse.stability) {
+                (Some(a), Some(b)) => assert!(
+                    (a - b).abs() < 1e-10,
+                    "stability mismatch for {select:?}: {a} vs {b}"
+                ),
+                (None, None) => {}
+                values => panic!("stability presence mismatch for {select:?}: {values:?}"),
+            }
+            for (j, (&a, &b)) in dense
+                .eigenvalues
+                .iter()
+                .zip(&sparse.eigenvalues)
+                .enumerate()
+            {
+                assert!(
+                    (a - b).abs() < 1e-8,
+                    "eigenvalue {j} mismatch for {select:?}: {a} vs {b}"
+                );
+            }
+            let dense_gram = &dense.embedding * dense.embedding.transpose();
+            let sparse_gram = &sparse.embedding * sparse.embedding.transpose();
+            let max_error = dense_gram
+                .iter()
+                .zip(sparse_gram.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                max_error < 1e-6,
+                "embedding Gram error {max_error} for {select:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_falls_back_to_dense_for_disconnected_large_graphs() {
+        let stack = two_blob_stack(5, 160, 0.02);
+        let cfg = Config {
+            n_neighbors: 10,
+            n_components: 8,
+            select: SelectSpec::Fixed(2),
+            parallel: true,
+            ..Config::default()
+        };
+        let dense = segment_with_solver(&stack, &cfg, SolverKind::Dense).unwrap();
+        let auto = segment_with_solver(&stack, &cfg, SolverKind::Auto).unwrap();
+        assert_eq!(auto.labels, dense.labels);
+        assert_eq!(auto.eigenvalues, dense.eigenvalues);
+        assert_eq!(auto.embedding, dense.embedding);
+        assert_eq!(auto.modularity, dense.modularity);
+    }
+
+    #[test]
+    fn sparse_parallel_matches_serial_end_to_end() {
+        let stack = connected_curve_stack(10, 320, 0.003);
+        let base = Config {
+            n_neighbors: 10,
+            n_components: 8,
+            select: SelectSpec::Stability {
+                max_k: 5,
+                n_boot: 4,
+                seed: 17,
+            },
+            seed: 5,
+            ..Config::default()
+        };
+        let parallel = segment(
+            &stack,
+            &Config {
+                parallel: true,
+                ..base
+            },
+        )
+        .unwrap();
+        let serial = segment(
+            &stack,
+            &Config {
+                parallel: false,
+                ..base
+            },
+        )
+        .unwrap();
+        assert_eq!(parallel.k, serial.k);
+        assert_eq!(
+            select::adjusted_rand_index(&parallel.labels, &serial.labels),
+            1.0
+        );
+        assert_eq!(parallel.stability, serial.stability);
+        assert_eq!(parallel.modularity, serial.modularity);
+        for (&a, &b) in parallel.eigenvalues.iter().zip(&serial.eigenvalues) {
+            assert!((a - b).abs() < 1e-10, "{a} vs {b}");
+        }
     }
 
     #[test]

@@ -36,11 +36,16 @@ fn dist2(x: &DMatrix<f64>, p: usize, center: &[f64]) -> f64 {
 fn njw_features(vectors: &DMatrix<f64>, n_dims: usize) -> DMatrix<f64> {
     let m = vectors.nrows();
     let d = n_dims.min(vectors.ncols()).max(1);
+    let norms: Vec<f64> = (0..m)
+        .map(|p| {
+            (0..d)
+                .map(|k| vectors[(p, k)] * vectors[(p, k)])
+                .sum::<f64>()
+                .sqrt()
+        })
+        .collect();
     DMatrix::from_fn(m, d, |p, c| {
-        let norm: f64 = (0..d)
-            .map(|k| vectors[(p, k)] * vectors[(p, k)])
-            .sum::<f64>()
-            .sqrt();
+        let norm = norms[p];
         if norm > 1e-300 {
             vectors[(p, c)] / norm
         } else {

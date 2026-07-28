@@ -1,10 +1,14 @@
 //! Model-selection metrics: Newman-Girvan modularity, the eigengap
 //! heuristic, and the adjusted Rand index used by stability selection.
 
+use crate::affinity::EdgeWeights;
+use crate::graph::Graph;
+#[cfg(test)]
 use nalgebra::DMatrix;
 use std::collections::HashMap;
 
 /// Newman-Girvan modularity `Q` of a labeling on the weighted graph `w`.
+#[cfg(test)]
 pub fn modularity(w: &DMatrix<f64>, labels: &[usize]) -> f64 {
     let m = w.nrows();
     let mut degree = vec![0.0_f64; m];
@@ -25,6 +29,45 @@ pub fn modularity(w: &DMatrix<f64>, labels: &[usize]) -> f64 {
         for q in 0..m {
             if labels[p] == labels[q] {
                 l_in[labels[p]] += w[(p, q)];
+            }
+        }
+    }
+    let mut q = 0.0;
+    for c in 0..k {
+        let a = l_in[c] / m2;
+        let b = d_tot[c] / m2;
+        q += a - b * b;
+    }
+    q
+}
+
+/// Newman-Girvan modularity evaluated only on graph edges. The row and
+/// neighbor traversal order matches the dense implementation, so structural
+/// zeros are skipped without changing the floating-point reduction order.
+pub fn modularity_edges(graph: &Graph, w: &EdgeWeights, labels: &[usize]) -> f64 {
+    let m = graph.len();
+    let mut degree = vec![0.0_f64; m];
+    let mut m2 = 0.0;
+    for p in 0..m {
+        for &edge in graph.incident_edges(p) {
+            degree[p] += w.values()[edge];
+        }
+        m2 += degree[p];
+    }
+    if m2 <= 0.0 {
+        return 0.0;
+    }
+    let k = labels.iter().copied().max().map(|x| x + 1).unwrap_or(0);
+    let mut l_in = vec![0.0_f64; k];
+    let mut d_tot = vec![0.0_f64; k];
+    for p in 0..m {
+        let label = labels[p];
+        d_tot[label] += degree[p];
+        for &edge in graph.incident_edges(p) {
+            let (a, b) = graph.edge_slice()[edge];
+            let q = if a == p { b } else { a };
+            if label == labels[q] {
+                l_in[label] += w.values()[edge];
             }
         }
     }
