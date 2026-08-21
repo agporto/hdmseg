@@ -75,6 +75,7 @@ seg.embedding     # (M, min(n_components, M - 1))
 seg.eigenvalues   # leading normalized-operator eigenvalues
 seg.modularity
 seg.stability     # bootstrap stability, or None
+hdmseg.__version__
 ```
 
 Parameter guidance is in [`docs/TUNING.md`](docs/TUNING.md).
@@ -164,7 +165,7 @@ locus, geodesic assignment, or harmonic interpolation.
   Harmonic Analysis, 2006.
 - A. Ng, M. Jordan, and Y. Weiss, *On Spectral Clustering: Analysis and an
   Algorithm*, NIPS 2002.
-- L. Zelnik-Manor and Y. Weiss, *Self-Tuning Spectral Clustering*, NIPS 2004.
+- L. Zelnik-Manor and P. Perona, *Self-Tuning Spectral Clustering*, NIPS 2004.
 
 ## Development
 
