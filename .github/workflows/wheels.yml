@@ -9,6 +9,7 @@ on:
       - "Cargo.lock"
       - "src/**"
       - "python/**"
+      - "scripts/check_release.py"
       - "CITATION.cff"
       - "CHANGELOG.md"
       - ".github/workflows/wheels.yml"
@@ -18,6 +19,7 @@ on:
       - "Cargo.lock"
       - "src/**"
       - "python/**"
+      - "scripts/check_release.py"
       - "CITATION.cff"
       - "CHANGELOG.md"
       - ".github/workflows/wheels.yml"
@@ -27,8 +29,27 @@ permissions:
   contents: read
 
 jobs:
+  metadata:
+    name: release metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify synchronized metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            python scripts/check_release.py --expected-tag "$GITHUB_REF_NAME"
+          else
+            python scripts/check_release.py --skip-lock
+          fi
+
   build:
     name: wheel (${{ matrix.platform }})
+    needs: metadata
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -66,6 +87,7 @@ jobs:
 
   sdist:
     name: sdist
+    needs: metadata
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -87,9 +109,7 @@ jobs:
       fail-fast: false
       matrix:
         # Oldest supported and a current CPython on every OS; the same abi3
-        # wheel serves both, which is exactly what this verifies. 3.9 on macOS
-        # runs on the Intel runner (arm64 runners provide 3.10+ only); the
-        # universal2 wheel covers both architectures.
+        # wheel serves both. The universal2 wheel covers both macOS architectures.
         include:
           - { runner: ubuntu-latest, platform: linux-x86_64, python: "3.9" }
           - { runner: ubuntu-latest, platform: linux-x86_64, python: "3.13" }
@@ -113,13 +133,16 @@ jobs:
           python -m pip install --no-index --find-links dist hdmseg
           python -m pytest python/tests -q
 
-  tag-tested-release:
-    name: Tag tested version
+  prepare-release:
+    name: prepare tested release
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [build, sdist, test]
+    needs: [metadata, build, sdist, test]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      should_publish: ${{ steps.release.outputs.should_publish }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -132,123 +155,58 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo generate-lockfile
+          cargo metadata --format-version 1 --no-deps > /dev/null
           if ! git diff --quiet -- Cargo.lock; then
+            VERSION="$(python scripts/check_release.py --skip-lock --print-version)"
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add -- Cargo.lock
-            VERSION="$(python - <<'PY'
-          import tomllib
-          with open('Cargo.toml', 'rb') as stream:
-              print(tomllib.load(stream)['package']['version'])
-          PY
-          )"
             git commit -m "Sync Cargo.lock for v${VERSION}"
             git push origin HEAD:main
           fi
-      - name: Verify release metadata and create tag
+      - name: Verify metadata and create release tag
+        id: release
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="$(python - <<'PY'
-          import tomllib
-          with open('Cargo.toml', 'rb') as stream:
-              print(tomllib.load(stream)['package']['version'])
-          PY
-          )"
+          VERSION="$(python scripts/check_release.py --print-version)"
           TAG="v${VERSION}"
-          python - "$VERSION" <<'PY'
-          import re
-          import sys
-          import tomllib
-          from pathlib import Path
-
-          version = sys.argv[1]
-          with Path('python/Cargo.toml').open('rb') as stream:
-              binding_version = tomllib.load(stream)['package']['version']
-          citation = Path('CITATION.cff').read_text(encoding='utf-8')
-          changelog = Path('CHANGELOG.md').read_text(encoding='utf-8')
-          lockfile = Path('Cargo.lock').read_text(encoding='utf-8')
-          citation_match = re.search(r'(?m)^version:\s*([0-9.]+)\s*$', citation)
-
-          errors = []
-          if binding_version != version:
-              errors.append(
-                  f'python/Cargo.toml is {binding_version}, expected {version}'
-              )
-          if citation_match is None or citation_match.group(1) != version:
-              errors.append('CITATION.cff version does not match Cargo.toml')
-          if f'## [{version}]' not in changelog:
-              errors.append(f'CHANGELOG.md has no release section for {version}')
-          for package in ('hdmseg', 'hdmseg-python'):
-              marker = f'[[package]]\nname = "{package}"\nversion = "{version}"'
-              if marker not in lockfile:
-                  errors.append(f'Cargo.lock version is stale for {package}')
-          if errors:
-              raise SystemExit('\n'.join(errors))
-          print(f'release metadata verified for v{version}')
-          PY
-          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
-            echo "${TAG} already exists; no release tag created."
+          python scripts/check_release.py --expected-tag "$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" > /dev/null 2>&1; then
+            echo "${TAG} already exists; this main-branch run will not republish it."
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git tag -a "$TAG" -m "hdmseg ${VERSION}"
           git push origin "$TAG"
+          echo "should_publish=true" >> "$GITHUB_OUTPUT"
 
   publish:
     name: Publish to PyPI
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, sdist, test]
+    if: >-
+      always() &&
+      needs.metadata.result == 'success' &&
+      needs.build.result == 'success' &&
+      needs.sdist.result == 'success' &&
+      needs.test.result == 'success' &&
+      (
+        startsWith(github.ref, 'refs/tags/v') ||
+        (
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          needs.prepare-release.result == 'success' &&
+          needs.prepare-release.outputs.should_publish == 'true'
+        )
+      )
+    needs: [metadata, build, sdist, test, prepare-release]
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/p/hdmseg
     permissions:
-      contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Verify tag and release metadata
-        shell: bash
-        run: |
-          python - <<'PY'
-          import os
-          import re
-          import tomllib
-          from pathlib import Path
-
-          with Path('Cargo.toml').open('rb') as stream:
-              version = tomllib.load(stream)['package']['version']
-          with Path('python/Cargo.toml').open('rb') as stream:
-              binding_version = tomllib.load(stream)['package']['version']
-          tag = os.environ['GITHUB_REF_NAME']
-          citation = Path('CITATION.cff').read_text(encoding='utf-8')
-          changelog = Path('CHANGELOG.md').read_text(encoding='utf-8')
-          lockfile = Path('Cargo.lock').read_text(encoding='utf-8')
-          citation_match = re.search(r'(?m)^version:\s*([0-9.]+)\s*$', citation)
-
-          errors = []
-          if tag != f'v{version}':
-              errors.append(f'tag {tag!r} does not match Cargo version v{version}')
-          if binding_version != version:
-              errors.append(
-                  f'python/Cargo.toml is {binding_version}, expected {version}'
-              )
-          if citation_match is None or citation_match.group(1) != version:
-              errors.append('CITATION.cff version does not match Cargo.toml')
-          if f'## [{version}]' not in changelog:
-              errors.append(f'CHANGELOG.md has no release section for {version}')
-          for package in ('hdmseg', 'hdmseg-python'):
-              marker = f'[[package]]\nname = "{package}"\nversion = "{version}"'
-              if marker not in lockfile:
-                  errors.append(f'Cargo.lock version is stale for {package}')
-          if errors:
-              raise SystemExit('\n'.join(errors))
-          print(f'release metadata verified for {tag}')
-          PY
       - uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
@@ -259,13 +217,14 @@ jobs:
 
   release:
     name: GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [publish]
+    if: always() && needs.publish.result == 'success'
+    needs: [publish, prepare-release]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      RELEASE_TAG: ${{ needs.prepare-release.outputs.tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
@@ -275,7 +234,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
-          gh release create "$GITHUB_REF_NAME" dist/*
+          gh release create "$RELEASE_TAG" dist/*
+          --repo "$GITHUB_REPOSITORY"
           --verify-tag
           --generate-notes
-          --title "$GITHUB_REF_NAME"
+          --title "$RELEASE_TAG"
