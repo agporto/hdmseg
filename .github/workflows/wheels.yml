@@ -47,9 +47,54 @@ jobs:
             python scripts/check_release.py --skip-lock
           fi
 
+  prepare-source:
+    name: prepare release source
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      tag: ${{ steps.source.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Synchronize lockfile and identify source
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --format-version 1 --no-deps > /dev/null
+          if ! git diff --quiet -- Cargo.lock; then
+            VERSION="$(python scripts/check_release.py --skip-lock --print-version)"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -- Cargo.lock
+            git commit -m "Sync Cargo.lock for v${VERSION}"
+            git push origin HEAD:main
+          fi
+          VERSION="$(python scripts/check_release.py --print-version)"
+          TAG="v${VERSION}"
+          python scripts/check_release.py --expected-tag "$TAG"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
   build:
     name: wheel (${{ matrix.platform }})
-    needs: metadata
+    if: >-
+      always() &&
+      needs.metadata.result == 'success' &&
+      (
+        needs.prepare-source.result == 'success' ||
+        needs.prepare-source.result == 'skipped'
+      )
+    needs: [metadata, prepare-source]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -69,6 +114,8 @@ jobs:
             target: x64
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-source.outputs.sha || github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -87,10 +134,19 @@ jobs:
 
   sdist:
     name: sdist
-    needs: metadata
+    if: >-
+      always() &&
+      needs.metadata.result == 'success' &&
+      (
+        needs.prepare-source.result == 'success' ||
+        needs.prepare-source.result == 'skipped'
+      )
+    needs: [metadata, prepare-source]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-source.outputs.sha || github.sha }}
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
@@ -118,6 +174,8 @@ jobs:
           - { runner: windows-latest, platform: windows-x64, python: "3.13" }
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-source.outputs.sha || github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
@@ -133,10 +191,10 @@ jobs:
           python -m pip install --no-index --find-links dist hdmseg
           python -m pytest python/tests -q
 
-  prepare-release:
-    name: prepare tested release
+  tag-release:
+    name: tag tested release
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [metadata, build, sdist, test]
+    needs: [prepare-source, build, sdist, test]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -146,31 +204,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.prepare-source.outputs.sha }}
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Synchronize generated lockfile
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo metadata --format-version 1 --no-deps > /dev/null
-          if ! git diff --quiet -- Cargo.lock; then
-            VERSION="$(python scripts/check_release.py --skip-lock --print-version)"
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add -- Cargo.lock
-            git commit -m "Sync Cargo.lock for v${VERSION}"
-            git push origin HEAD:main
-          fi
-      - name: Verify metadata and create release tag
+      - name: Verify tested source and create tag
         id: release
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="$(python scripts/check_release.py --print-version)"
-          TAG="v${VERSION}"
+          TAG="${{ needs.prepare-source.outputs.tag }}"
           python scripts/check_release.py --expected-tag "$TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" > /dev/null 2>&1; then
@@ -178,6 +222,9 @@ jobs:
             echo "should_publish=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          VERSION="${TAG#v}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$TAG" -m "hdmseg ${VERSION}"
           git push origin "$TAG"
           echo "should_publish=true" >> "$GITHUB_OUTPUT"
@@ -195,11 +242,11 @@ jobs:
         (
           github.event_name == 'push' &&
           github.ref == 'refs/heads/main' &&
-          needs.prepare-release.result == 'success' &&
-          needs.prepare-release.outputs.should_publish == 'true'
+          needs.tag-release.result == 'success' &&
+          needs.tag-release.outputs.should_publish == 'true'
         )
       )
-    needs: [metadata, build, sdist, test, prepare-release]
+    needs: [metadata, prepare-source, build, sdist, test, tag-release]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -218,12 +265,12 @@ jobs:
   release:
     name: GitHub Release
     if: always() && needs.publish.result == 'success'
-    needs: [publish, prepare-release]
+    needs: [publish, tag-release]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
-      RELEASE_TAG: ${{ needs.prepare-release.outputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ needs.tag-release.outputs.tag || github.ref_name }}
     steps:
       - uses: actions/download-artifact@v4
         with:
