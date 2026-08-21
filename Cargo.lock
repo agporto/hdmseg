@@ -565,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "hdmseg"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "approx",
  "faer",
@@ -575,7 +575,7 @@ dependencies = [
 
 [[package]]
 name = "hdmseg-python"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hdmseg",
  "nalgebra",
