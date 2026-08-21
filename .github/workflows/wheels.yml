@@ -70,7 +70,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo metadata --format-version 1 --no-deps > /dev/null
+          cargo check --workspace --all-targets --all-features
           if ! git diff --quiet -- Cargo.lock; then
             VERSION="$(python scripts/check_release.py --skip-lock --print-version)"
             git config user.name "github-actions[bot]"
