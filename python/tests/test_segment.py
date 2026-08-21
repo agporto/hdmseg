@@ -1,5 +1,7 @@
 """End-to-end tests for the hdmseg Python bindings."""
 
+from importlib.metadata import version
+
 import numpy as np
 import pytest
 
@@ -98,3 +100,7 @@ def test_invalid_reference_shape():
     X = two_blob_stack(per=10, n=4)
     with pytest.raises(ValueError):
         hdmseg.segment(X, k=2, reference=np.zeros((X.shape[1], 2)))
+
+
+def test_version_matches_distribution_metadata():
+    assert hdmseg.__version__ == version("hdmseg")

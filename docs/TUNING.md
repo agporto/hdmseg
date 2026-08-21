@@ -35,18 +35,35 @@ clustering paper.
 - `diffusion_time` must be finite and non-negative. It controls the `|λ|^t`
   scaling of exported coordinates.
 
-## Dense-solver scale
+## Large-data scale
 
-hdmseg currently performs a full dense eigendecomposition:
+For a connected positive-weight graph with at least 256 loci, hdmseg stores
+only the union-kNN edges and computes the requested leading eigenpairs with a
+partial self-adjoint Krylov-Schur solve. The operator math is unchanged.
 
-- operator memory is `O(M²)`;
-- eigendecomposition time is `O(M³)`;
-- stability selection repeats the solve `n_boot` times.
+- Let `E` be the number of undirected graph edges. Operator storage is `O(E)`,
+  and sparse matrix-vector products are `O(E)`.
+- The eigensolver also stores an `M × r` Krylov basis, where `r` grows with
+  the number of requested leading modes.
+- `n_components` and `max_k` both affect how many leading modes are required.
+- Stability selection caches `N × E` affinities once, then reuses them for all
+  `n_boot` resamples. Larger `n_boot` adds solves but not affinity-cache size.
+- Fixing `k`, eigengap selection, and modularity selection do not allocate the
+  stability cache.
 
-There is no automatic large-data approximation. Benchmark representative
-inputs and monitor peak memory before increasing `M` or `n_boot`. Fixing `k`
-avoids bootstrap/model-selection solves but does not change the dense
-eigendecomposition cost of one segmentation.
+Small graphs use the dense solver because it is faster there. Disconnected
+graphs and sparse solves that miss strict convergence checks also fall back to
+the original dense implementation, which uses `O(M²)` memory and `O(M³)` time.
+For a large unexpected fallback, first check whether `n_neighbors` produced a
+disconnected graph; change it only when a denser neighborhood is scientifically
+appropriate.
+
+Benchmark representative inputs and monitor peak memory. A reproducible smoke
+benchmark is available:
+
+```bash
+cargo run --release --example bench_scale -- 1000 5000 fixed
+```
 
 ## Determinism
 

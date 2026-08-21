@@ -6,7 +6,9 @@ abstract: >-
   population-consistent surface segmentation for homologous shapes in dense
   correspondence. It builds a frame-free consensus diffusion operator on the
   loci, embeds it spectrally, and clusters the embedding into regions coherent
-  across the whole sample, with bootstrap-stability model selection.
+  across the whole sample, with bootstrap-stability model selection. Large
+  connected graphs use an edge-sparse operator and partial eigensolver, with a
+  validated dense fallback for small, disconnected, or nonconverged cases.
 type: software
 authors:
   - family-names: Porto
@@ -15,7 +17,8 @@ authors:
 license: BSD-2-Clause
 repository-code: "https://github.com/agporto/hdmseg"
 url: "https://github.com/agporto/hdmseg"
-version: 0.1.0
+version: 0.2.0
+date-released: 2026-08-20
 keywords:
   - surface segmentation
   - diffusion maps

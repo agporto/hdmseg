@@ -9,6 +9,9 @@ on:
       - "Cargo.lock"
       - "src/**"
       - "python/**"
+      - "scripts/check_release.py"
+      - "CITATION.cff"
+      - "CHANGELOG.md"
       - ".github/workflows/wheels.yml"
   pull_request:
     paths:
@@ -16,6 +19,9 @@ on:
       - "Cargo.lock"
       - "src/**"
       - "python/**"
+      - "scripts/check_release.py"
+      - "CITATION.cff"
+      - "CHANGELOG.md"
       - ".github/workflows/wheels.yml"
   workflow_dispatch:
 
@@ -23,8 +29,72 @@ permissions:
   contents: read
 
 jobs:
+  metadata:
+    name: release metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify synchronized metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            python scripts/check_release.py --expected-tag "$GITHUB_REF_NAME"
+          else
+            python scripts/check_release.py --skip-lock
+          fi
+
+  prepare-source:
+    name: prepare release source
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      tag: ${{ steps.source.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Synchronize lockfile and identify source
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --format-version 1 --no-deps > /dev/null
+          if ! git diff --quiet -- Cargo.lock; then
+            VERSION="$(python scripts/check_release.py --skip-lock --print-version)"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -- Cargo.lock
+            git commit -m "Sync Cargo.lock for v${VERSION}"
+            git push origin HEAD:main
+          fi
+          VERSION="$(python scripts/check_release.py --print-version)"
+          TAG="v${VERSION}"
+          python scripts/check_release.py --expected-tag "$TAG"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
   build:
     name: wheel (${{ matrix.platform }})
+    if: >-
+      always() &&
+      needs.metadata.result == 'success' &&
+      (
+        needs.prepare-source.result == 'success' ||
+        needs.prepare-source.result == 'skipped'
+      )
+    needs: [metadata, prepare-source]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -44,6 +114,8 @@ jobs:
             target: x64
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-source.outputs.sha || github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -62,9 +134,19 @@ jobs:
 
   sdist:
     name: sdist
+    if: >-
+      always() &&
+      needs.metadata.result == 'success' &&
+      (
+        needs.prepare-source.result == 'success' ||
+        needs.prepare-source.result == 'skipped'
+      )
+    needs: [metadata, prepare-source]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-source.outputs.sha || github.sha }}
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
@@ -77,15 +159,20 @@ jobs:
 
   test:
     name: test (${{ matrix.platform }}, py${{ matrix.python }})
-    needs: build
+    if: >-
+      always() &&
+      needs.build.result == 'success' &&
+      (
+        needs.prepare-source.result == 'success' ||
+        needs.prepare-source.result == 'skipped'
+      )
+    needs: [build, prepare-source]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         # Oldest supported and a current CPython on every OS; the same abi3
-        # wheel serves both, which is exactly what this verifies. 3.9 on macOS
-        # runs on the Intel runner (arm64 runners provide 3.10+ only); the
-        # universal2 wheel covers both architectures.
+        # wheel serves both. The universal2 wheel covers both macOS architectures.
         include:
           - { runner: ubuntu-latest, platform: linux-x86_64, python: "3.9" }
           - { runner: ubuntu-latest, platform: linux-x86_64, python: "3.13" }
@@ -94,6 +181,8 @@ jobs:
           - { runner: windows-latest, platform: windows-x64, python: "3.13" }
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-source.outputs.sha || github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
@@ -109,10 +198,62 @@ jobs:
           python -m pip install --no-index --find-links dist hdmseg
           python -m pytest python/tests -q
 
+  tag-release:
+    name: tag tested release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [prepare-source, build, sdist, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      should_publish: ${{ steps.release.outputs.should_publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-source.outputs.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify tested source and create tag
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.prepare-source.outputs.tag }}"
+          python scripts/check_release.py --expected-tag "$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" > /dev/null 2>&1; then
+            echo "${TAG} already exists; this main-branch run will not republish it."
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          VERSION="${TAG#v}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "hdmseg ${VERSION}"
+          git push origin "$TAG"
+          echo "should_publish=true" >> "$GITHUB_OUTPUT"
+
   publish:
     name: Publish to PyPI
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, sdist, test]
+    if: >-
+      always() &&
+      needs.metadata.result == 'success' &&
+      needs.build.result == 'success' &&
+      needs.sdist.result == 'success' &&
+      needs.test.result == 'success' &&
+      (
+        startsWith(github.ref, 'refs/tags/v') ||
+        (
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          needs.tag-release.result == 'success' &&
+          needs.tag-release.outputs.should_publish == 'true'
+        )
+      )
+    needs: [metadata, prepare-source, build, sdist, test, tag-release]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -130,13 +271,14 @@ jobs:
 
   release:
     name: GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [publish]
+    if: always() && needs.publish.result == 'success'
+    needs: [publish, tag-release]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      RELEASE_TAG: ${{ needs.tag-release.outputs.tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
@@ -146,7 +288,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
-          gh release create "$GITHUB_REF_NAME" dist/*
+          gh release create "$RELEASE_TAG" dist/*
+          --repo "$GITHUB_REPOSITORY"
           --verify-tag
           --generate-notes
-          --title "$GITHUB_REF_NAME"
+          --title "$RELEASE_TAG"
