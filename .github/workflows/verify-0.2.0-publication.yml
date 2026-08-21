@@ -1,0 +1,58 @@
+name: Verify hdmseg 0.2.0 publication
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/verify-0.2.0-publication.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download and import the public PyPI wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for attempt in $(seq 1 20); do
+            rm -f dist/*
+            if python -m pip download \
+              --disable-pip-version-check \
+              --only-binary=:all: \
+              --no-deps \
+              --dest dist \
+              hdmseg==0.2.0; then
+              break
+            fi
+            if [[ "$attempt" -eq 20 ]]; then
+              echo "hdmseg 0.2.0 was not available from PyPI after 20 attempts" >&2
+              exit 1
+            fi
+            sleep 15
+          done
+          python -m pip install \
+            --disable-pip-version-check \
+            --no-index \
+            --find-links dist \
+            hdmseg==0.2.0
+          python - <<'PY'
+          import hdmseg
+          assert hdmseg.__version__ == "0.2.0", hdmseg.__version__
+          print("PyPI import verified:", hdmseg.__version__)
+          PY
+      - name: Verify GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view v0.2.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,assets \
+            --jq '.tagName, (.assets[] | .name)'
