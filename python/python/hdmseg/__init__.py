@@ -16,11 +16,18 @@ seg.k, seg.modularity, seg.stability
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version as _distribution_version
+
 import numpy as np
 
 from ._core import Segmentation, segment as _segment
 
-__all__ = ["segment", "Segmentation"]
+try:
+    __version__ = _distribution_version("hdmseg")
+except PackageNotFoundError:
+    __version__ = "0.0.0+unknown"
+
+__all__ = ["segment", "Segmentation", "__version__"]
 
 
 def segment(
