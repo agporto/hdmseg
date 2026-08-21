@@ -38,7 +38,11 @@ jobs:
           done
           python -m pip install \
             --disable-pip-version-check \
+            "numpy>=1.21"
+          python -m pip install \
+            --disable-pip-version-check \
             --no-index \
+            --no-deps \
             --find-links dist \
             hdmseg==0.2.0
           python - <<'PY'
