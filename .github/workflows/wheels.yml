@@ -159,7 +159,14 @@ jobs:
 
   test:
     name: test (${{ matrix.platform }}, py${{ matrix.python }})
-    needs: build
+    if: >-
+      always() &&
+      needs.build.result == 'success' &&
+      (
+        needs.prepare-source.result == 'success' ||
+        needs.prepare-source.result == 'skipped'
+      )
+    needs: [build, prepare-source]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
