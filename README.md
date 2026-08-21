@@ -23,16 +23,23 @@ The implementation is inspired by correspondence-aware diffusion methods, but
 it is **not** a horizontal or hypoelliptic diffusion-map implementation. It has
 no fibre-bundle state, horizontal transport, or hypoelliptic graph Laplacian.
 
-## Install from GitHub
+## Install
 
-Python 3.9 or newer and a Rust 1.87 or newer toolchain are required when
-building from source.
+Prebuilt wheels support CPython 3.9 and newer on the platforms included in the
+release workflow:
+
+```bash
+python -m pip install "hdmseg>=0.2,<0.3"
+```
+
+To install the current development version from GitHub instead:
 
 ```bash
 python -m pip install "git+https://github.com/agporto/hdmseg.git#subdirectory=python"
 ```
 
-For local development:
+Building from source requires Python 3.9 or newer and Rust 1.87 or newer. For
+local development:
 
 ```bash
 git clone https://github.com/agporto/hdmseg.git
@@ -40,8 +47,7 @@ cd hdmseg
 python -m pip install ./python
 ```
 
-Tagged GitHub Releases contain prebuilt wheels and a source distribution.
-The project is not published to PyPI or crates.io.
+Tagged GitHub Releases contain the platform wheels and a source distribution.
 
 ## Python example
 
@@ -158,7 +164,7 @@ locus, geodesic assignment, or harmonic interpolation.
   Harmonic Analysis, 2006.
 - A. Ng, M. Jordan, and Y. Weiss, *On Spectral Clustering: Analysis and an
   Algorithm*, NIPS 2002.
-- L. Zelnik-Manor and P. Perona, *Self-Tuning Spectral Clustering*, NIPS 2004.
+- L. Zelnik-Manor and Y. Weiss, *Self-Tuning Spectral Clustering*, NIPS 2004.
 
 ## Development
 
