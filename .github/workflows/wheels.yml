@@ -9,6 +9,8 @@ on:
       - "Cargo.lock"
       - "src/**"
       - "python/**"
+      - "CITATION.cff"
+      - "CHANGELOG.md"
       - ".github/workflows/wheels.yml"
   pull_request:
     paths:
@@ -16,6 +18,8 @@ on:
       - "Cargo.lock"
       - "src/**"
       - "python/**"
+      - "CITATION.cff"
+      - "CHANGELOG.md"
       - ".github/workflows/wheels.yml"
   workflow_dispatch:
 
@@ -109,6 +113,88 @@ jobs:
           python -m pip install --no-index --find-links dist hdmseg
           python -m pytest python/tests -q
 
+  tag-tested-release:
+    name: Tag tested version
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build, sdist, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Synchronize generated lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo generate-lockfile
+          if ! git diff --quiet -- Cargo.lock; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -- Cargo.lock
+            VERSION="$(python - <<'PY'
+          import tomllib
+          with open('Cargo.toml', 'rb') as stream:
+              print(tomllib.load(stream)['package']['version'])
+          PY
+          )"
+            git commit -m "Sync Cargo.lock for v${VERSION}"
+            git push origin HEAD:main
+          fi
+      - name: Verify release metadata and create tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(python - <<'PY'
+          import tomllib
+          with open('Cargo.toml', 'rb') as stream:
+              print(tomllib.load(stream)['package']['version'])
+          PY
+          )"
+          TAG="v${VERSION}"
+          python - "$VERSION" <<'PY'
+          import re
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          version = sys.argv[1]
+          with Path('python/Cargo.toml').open('rb') as stream:
+              binding_version = tomllib.load(stream)['package']['version']
+          citation = Path('CITATION.cff').read_text(encoding='utf-8')
+          changelog = Path('CHANGELOG.md').read_text(encoding='utf-8')
+          lockfile = Path('Cargo.lock').read_text(encoding='utf-8')
+          citation_match = re.search(r'(?m)^version:\s*([0-9.]+)\s*$', citation)
+
+          errors = []
+          if binding_version != version:
+              errors.append(
+                  f'python/Cargo.toml is {binding_version}, expected {version}'
+              )
+          if citation_match is None or citation_match.group(1) != version:
+              errors.append('CITATION.cff version does not match Cargo.toml')
+          if f'## [{version}]' not in changelog:
+              errors.append(f'CHANGELOG.md has no release section for {version}')
+          for package in ('hdmseg', 'hdmseg-python'):
+              marker = f'[[package]]\nname = "{package}"\nversion = "{version}"'
+              if marker not in lockfile:
+                  errors.append(f'Cargo.lock version is stale for {package}')
+          if errors:
+              raise SystemExit('\n'.join(errors))
+          print(f'release metadata verified for v{version}')
+          PY
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "${TAG} already exists; no release tag created."
+            exit 0
+          fi
+          git tag -a "$TAG" -m "hdmseg ${VERSION}"
+          git push origin "$TAG"
+
   publish:
     name: Publish to PyPI
     if: startsWith(github.ref, 'refs/tags/v')
@@ -118,8 +204,51 @@ jobs:
       name: pypi
       url: https://pypi.org/p/hdmseg
     permissions:
+      contents: read
       id-token: write
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify tag and release metadata
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          with Path('Cargo.toml').open('rb') as stream:
+              version = tomllib.load(stream)['package']['version']
+          with Path('python/Cargo.toml').open('rb') as stream:
+              binding_version = tomllib.load(stream)['package']['version']
+          tag = os.environ['GITHUB_REF_NAME']
+          citation = Path('CITATION.cff').read_text(encoding='utf-8')
+          changelog = Path('CHANGELOG.md').read_text(encoding='utf-8')
+          lockfile = Path('Cargo.lock').read_text(encoding='utf-8')
+          citation_match = re.search(r'(?m)^version:\s*([0-9.]+)\s*$', citation)
+
+          errors = []
+          if tag != f'v{version}':
+              errors.append(f'tag {tag!r} does not match Cargo version v{version}')
+          if binding_version != version:
+              errors.append(
+                  f'python/Cargo.toml is {binding_version}, expected {version}'
+              )
+          if citation_match is None or citation_match.group(1) != version:
+              errors.append('CITATION.cff version does not match Cargo.toml')
+          if f'## [{version}]' not in changelog:
+              errors.append(f'CHANGELOG.md has no release section for {version}')
+          for package in ('hdmseg', 'hdmseg-python'):
+              marker = f'[[package]]\nname = "{package}"\nversion = "{version}"'
+              if marker not in lockfile:
+                  errors.append(f'Cargo.lock version is stale for {package}')
+          if errors:
+              raise SystemExit('\n'.join(errors))
+          print(f'release metadata verified for {tag}')
+          PY
       - uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
